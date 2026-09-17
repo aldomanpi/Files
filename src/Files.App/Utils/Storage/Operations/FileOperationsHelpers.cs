@@ -188,7 +188,7 @@ namespace Files.App.Utils.Storage
 			}, App.Logger);
 		}
 
-		public static Task<(bool, ShellOperationResult)> DeleteItemAsync(string[] fileToDeletePath, bool permanently, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel>? progress, string operationID = "")
+		public static Task<(bool, ShellOperationResult)> DeleteItemAsync(string[] fileToDeletePath, bool permanently, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel>? progress, string operationID = "", CancellationToken cancellationToken = default)
 		{
 			operationID = string.IsNullOrEmpty(operationID) ? Guid.NewGuid().ToString() : operationID;
 
@@ -259,6 +259,10 @@ namespace Files.App.Utils.Storage
 
 				progressHandler.OwnerWindow = op.OwnerWindow;
 				progressHandler.AddOperation(operationID);
+
+				// The operation can be canceled before it was added
+				if (cancellationToken.IsCancellationRequested)
+					progressHandler.TryCancel(operationID);
 
 				var deleteTcs = new TaskCompletionSource<bool>();
 
@@ -393,7 +397,7 @@ namespace Files.App.Utils.Storage
 			}, App.Logger);
 		}
 
-		public static Task<(bool, ShellOperationResult)> MoveItemAsync(string[] fileToMovePath, string[] moveDestination, bool overwriteOnMove, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel> progress, string operationID = "")
+		public static Task<(bool, ShellOperationResult)> MoveItemAsync(string[] fileToMovePath, string[] moveDestination, bool overwriteOnMove, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel> progress, string operationID = "", CancellationToken cancellationToken = default)
 		{
 			operationID = string.IsNullOrEmpty(operationID) ? Guid.NewGuid().ToString() : operationID;
 
@@ -405,10 +409,11 @@ namespace Files.App.Utils.Storage
 			var cts = new CancellationTokenSource();
 			var sizeCalculator = new FileSizeCalculator(fileToMovePath);
 
-			// Track the count and update the progress
+			// Track the count and the size and update the progress
 			sizeCalculator.ItemsCountChanged += (newCount) =>
 			{
 				fsProgress.ItemsCount = newCount;
+				fsProgress.TotalSize = sizeCalculator.Size;
 				fsProgress.Report();
 			};
 
@@ -465,6 +470,10 @@ namespace Files.App.Utils.Storage
 
 				progressHandler.OwnerWindow = op.OwnerWindow;
 				progressHandler.AddOperation(operationID);
+
+				// The operation can be canceled before it was added
+				if (cancellationToken.IsCancellationRequested)
+					progressHandler.TryCancel(operationID);
 
 				var moveTcs = new TaskCompletionSource<bool>();
 
@@ -527,11 +536,24 @@ namespace Files.App.Utils.Storage
 
 				cts.Cancel();
 
-				return (await moveTcs.Task, shellOperationResult);
+				var moveSucceeded = await moveTcs.Task;
+
+				if (moveSucceeded)
+				{
+					// The operation can complete before the enumeration reported the size, so make sure the progress ends at 100%
+					if (fsProgress.TotalSize < sizeCalculator.Size)
+						fsProgress.TotalSize = sizeCalculator.Size;
+
+					fsProgress.SetProcessedSize(fsProgress.TotalSize);
+					fsProgress.EnumerationCompleted = true;
+					fsProgress.ReportStatus(FileSystemStatusCode.Success);
+				}
+
+				return (moveSucceeded, shellOperationResult);
 			}, App.Logger);
 		}
 
-		public static Task<(bool, ShellOperationResult)> CopyItemAsync(string[] fileToCopyPath, string[] copyDestination, bool overwriteOnCopy, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel> progress, string operationID = "")
+		public static Task<(bool, ShellOperationResult)> CopyItemAsync(string[] fileToCopyPath, string[] copyDestination, bool overwriteOnCopy, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel> progress, string operationID = "", CancellationToken cancellationToken = default)
 		{
 			operationID = string.IsNullOrEmpty(operationID) ? Guid.NewGuid().ToString() : operationID;
 
@@ -543,10 +565,11 @@ namespace Files.App.Utils.Storage
 			var cts = new CancellationTokenSource();
 			var sizeCalculator = new FileSizeCalculator(fileToCopyPath);
 
-			// Track the count and update the progress
+			// Track the count and the size and update the progress
 			sizeCalculator.ItemsCountChanged += (newCount) =>
 			{
 				fsProgress.ItemsCount = newCount;
+				fsProgress.TotalSize = sizeCalculator.Size;
 				fsProgress.Report();
 			};
 
@@ -606,6 +629,10 @@ namespace Files.App.Utils.Storage
 
 				progressHandler.OwnerWindow = op.OwnerWindow;
 				progressHandler.AddOperation(operationID);
+
+				// The operation can be canceled before it was added
+				if (cancellationToken.IsCancellationRequested)
+					progressHandler.TryCancel(operationID);
 
 				var copyTcs = new TaskCompletionSource<bool>();
 
@@ -668,7 +695,20 @@ namespace Files.App.Utils.Storage
 
 				cts.Cancel();
 
-				return (await copyTcs.Task, shellOperationResult);
+				var copySucceeded = await copyTcs.Task;
+
+				if (copySucceeded)
+				{
+					// The operation can complete before the enumeration reported the size, so make sure the progress ends at 100%
+					if (fsProgress.TotalSize < sizeCalculator.Size)
+						fsProgress.TotalSize = sizeCalculator.Size;
+
+					fsProgress.SetProcessedSize(fsProgress.TotalSize);
+					fsProgress.EnumerationCompleted = true;
+					fsProgress.ReportStatus(FileSystemStatusCode.Success);
+				}
+
+				return (copySucceeded, shellOperationResult);
 			}, App.Logger);
 		}
 

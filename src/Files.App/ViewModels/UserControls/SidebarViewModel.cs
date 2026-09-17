@@ -1318,7 +1318,9 @@ namespace Files.App.ViewModels.UserControls
 			var hasStorageItems = storageItems.Any();
 			var drivePath = driveItem.GetRequiredPath();
 
-			if (Strings.Unknown.GetLocalizedResource().Equals(driveItem.SpaceText, StringComparison.OrdinalIgnoreCase) ||
+			// Drives with an unknown capacity (e.g. portable devices) are still valid drop targets,
+			// so readiness is determined by the drive type instead of the reported size
+			if (driveItem.Type is Data.Items.DriveType.NoRootDirectory ||
 				(hasStorageItems && (storageItems.AreItemsAlreadyInFolder(drivePath) || storageItems.ContainsDestinationOrAncestor(drivePath))))
 			{
 				args.RawEvent.AcceptedOperation = DataPackageOperation.None;

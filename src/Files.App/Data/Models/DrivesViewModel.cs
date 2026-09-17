@@ -60,41 +60,49 @@ namespace Files.App.Data.Models
 		private void Watcher_DeviceRemoved(object? sender, string e)
 		{
 			logger.LogInformation($"Drive removed: {e}");
-			lock (Drives)
-			{
-				// Depending on the event source, drives are identified by a drive letter
-				// or a device interface ID, so match on either.
-				var drive = Drives.FirstOrDefault(x =>
-					(x as DriveItem)?.DeviceID == e ||
-					x.Id.TrimEnd('\\').Equals(e.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase));
-				if (drive is not null)
-					Drives.Remove(drive);
-			}
 
-			// Update the collection on the ui-thread.
-			Watcher_EnumerationCompleted(null, EventArgs.Empty);
+			// The watcher raises this on a background thread, but the collection is bound to the UI
+			_ = MainWindow.Instance.DispatcherQueue.EnqueueOrInvokeAsync(() =>
+			{
+				lock (Drives)
+				{
+					// Depending on the event source, drives are identified by a drive letter
+					// or a device interface ID, so match on either.
+					var drive = Drives.FirstOrDefault(x =>
+						(x as DriveItem)?.DeviceID == e ||
+						x.Id.TrimEnd('\\').Equals(e.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase));
+					if (drive is not null)
+						Drives.Remove(drive);
+				}
+
+				Watcher_EnumerationCompleted(null, EventArgs.Empty);
+			});
 		}
 
 		private void Watcher_DeviceAdded(object? sender, IFolder e)
 		{
-			lock (Drives)
+			// The watcher raises this on a background thread, but the collection is bound to the UI
+			_ = MainWindow.Instance.DispatcherQueue.EnqueueOrInvokeAsync(() =>
 			{
-				// If drive already in list, remove it first.
-				var matchingDrive = Drives.FirstOrDefault(x =>
-					(x as DriveItem)?.DeviceID == (e as DriveItem)?.DeviceID ||
-					(string.IsNullOrEmpty(e.Id)
-						? x.Id.Contains(e.Name, StringComparison.OrdinalIgnoreCase)
-						: Path.GetFullPath(x.Id).Equals(Path.GetFullPath(e.Id), StringComparison.OrdinalIgnoreCase))
-				);
+				lock (Drives)
+				{
+					// If drive already in list, remove it first.
+					var matchingDrive = Drives.FirstOrDefault(x =>
+						(x as DriveItem)?.DeviceID == (e as DriveItem)?.DeviceID ||
+						(string.IsNullOrEmpty(e.Id)
+							? x.Id.Contains(e.Name, StringComparison.OrdinalIgnoreCase)
+							: Path.GetFullPath(x.Id).Equals(Path.GetFullPath(e.Id), StringComparison.OrdinalIgnoreCase))
+					);
 
-				if (matchingDrive is not null)
-					Drives.Remove(matchingDrive);
+					if (matchingDrive is not null)
+						Drives.Remove(matchingDrive);
 
-				logger.LogInformation($"Drive added: {e.Id}");
-				InsertSorted(e);
-			}
+					logger.LogInformation($"Drive added: {e.Id}");
+					InsertSorted(e);
+				}
 
-			Watcher_EnumerationCompleted(null, EventArgs.Empty);
+				Watcher_EnumerationCompleted(null, EventArgs.Empty);
+			});
 		}
 
 		public async Task UpdateDrivesAsync()
@@ -103,13 +111,20 @@ namespace Files.App.Data.Models
 
 			try
 			{
-				lock (Drives)
-					Drives.Clear();
+				// The enumeration runs on a background thread, but the collection is bound to the UI
+				await MainWindow.Instance.DispatcherQueue.EnqueueOrInvokeAsync(() =>
+				{
+					lock (Drives)
+						Drives.Clear();
+				});
 
 				await foreach (IFolder item in removableDrivesService.GetDrivesAsync())
 				{
-					lock (Drives)
-						InsertSorted(item);
+					await MainWindow.Instance.DispatcherQueue.EnqueueOrInvokeAsync(() =>
+					{
+						lock (Drives)
+							InsertSorted(item);
+					});
 				}
 
 				var osDrive = await removableDrivesService.GetPrimaryDriveAsync();

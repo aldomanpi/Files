@@ -11,8 +11,10 @@ using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Input;
 using Windows.ApplicationModel.DataTransfer;
+using Windows.ApplicationModel.DataTransfer.DragDrop;
 using WinRT;
 using Windows.Win32;
 using Windows.Win32.Storage.FileSystem;
@@ -395,8 +397,6 @@ namespace Files.App.ViewModels.UserControls
 			if (_lockFlag)
 				return;
 
-			_lockFlag = true;
-
 			// Reset dragged over pathbox item
 			_dragOverPath = null;
 
@@ -408,24 +408,31 @@ namespace Files.App.ViewModels.UserControls
 				return;
 			}
 
+			_lockFlag = true;
+
 			var deferral = e.GetDeferral();
 
-			var signal = new AsyncManualResetEvent();
-
-			PathBoxItemDropped?.Invoke(this, new PathBoxItemDroppedEventArgs()
+			try
 			{
-				AcceptedOperation = e.AcceptedOperation,
-				Package = e.DataView,
-				Path = pathBoxItem.Path,
-				SignalEvent = signal
-			});
+				var signal = new AsyncManualResetEvent();
 
-			await signal.WaitAsync();
+				PathBoxItemDropped?.Invoke(this, new PathBoxItemDroppedEventArgs()
+				{
+					AcceptedOperation = e.AcceptedOperation,
+					Package = e.DataView,
+					Path = pathBoxItem.Path,
+					SignalEvent = signal
+				});
 
-			deferral.Complete();
-			await Task.Yield();
+				await signal.WaitAsync();
+			}
+			finally
+			{
+				deferral.Complete();
+				await Task.Yield();
 
-			_lockFlag = false;
+				_lockFlag = false;
+			}
 		}
 
 		[Obsolete("Superseded by Omnibar.")]
@@ -480,36 +487,70 @@ namespace Files.App.ViewModels.UserControls
 			e.Handled = true;
 			var deferral = e.GetDeferral();
 
-			var storageItems = await FilesystemHelpers.GetDraggedStorageItems(e.DataView);
-
-			if (storageItems.ContainsDestinationOrAncestor(pathBoxItem.Path) ||
-				!storageItems.Any(storageItem =>
-					!string.IsNullOrEmpty(storageItem?.Path) &&
-					storageItem.Path.Replace(pathBoxItem.Path, string.Empty, StringComparison.Ordinal)
-						.Trim(Path.DirectorySeparatorChar)
-						.Contains(Path.DirectorySeparatorChar)))
+			try
 			{
-				e.AcceptedOperation = DataPackageOperation.None;
-			}
+				var storageItems = await FilesystemHelpers.GetDraggedStorageItems(e.DataView);
 
-			// Copy be default when dragging from zip
-			else if (storageItems.Any(x =>
-					x.Item is ZipStorageFile ||
-					x.Item is ZipStorageFolder) ||
-					ZipStorageFolder.IsZipPath(pathBoxItem.Path))
-			{
-				e.DragUIOverride.Caption = string.Format(Strings.CopyToFolderCaptionText.GetLocalizedResource(), pathBoxItem.Title);
-				e.AcceptedOperation = DataPackageOperation.Copy;
-			}
-			else
-			{
-				e.DragUIOverride.IsCaptionVisible = true;
-				e.DragUIOverride.Caption = string.Format(Strings.MoveToFolderCaptionText.GetLocalizedResource(), pathBoxItem.Title);
-				// Some applications such as Edge can't raise the drop event by the Move flag (#14008), so we set the Copy flag as well.
-				e.AcceptedOperation = DataPackageOperation.Move | DataPackageOperation.Copy;
-			}
+				if (storageItems.ContainsDestinationOrAncestor(pathBoxItem.Path) ||
+					!storageItems.Any(storageItem =>
+						!string.IsNullOrEmpty(storageItem?.Path) &&
+						storageItem.Path.Replace(pathBoxItem.Path, string.Empty, StringComparison.Ordinal)
+							.Trim(Path.DirectorySeparatorChar)
+							.Contains(Path.DirectorySeparatorChar)))
+				{
+					e.AcceptedOperation = DataPackageOperation.None;
+				}
+				else
+				{
+					e.DragUIOverride.IsCaptionVisible = true;
 
-			deferral.Complete();
+					if (e.Modifiers.HasFlag(DragDropModifiers.Alt) || e.Modifiers.HasFlag(DragDropModifiers.Control | DragDropModifiers.Shift))
+					{
+						e.DragUIOverride.Caption = string.Format(Strings.LinkToFolderCaptionText.GetLocalizedResource(), pathBoxItem.Title);
+						e.AcceptedOperation = DataPackageOperation.Link;
+					}
+					else if (e.Modifiers.HasFlag(DragDropModifiers.Control))
+					{
+						e.DragUIOverride.Caption = string.Format(Strings.CopyToFolderCaptionText.GetLocalizedResource(), pathBoxItem.Title);
+						e.AcceptedOperation = DataPackageOperation.Copy;
+					}
+					else if (e.Modifiers.HasFlag(DragDropModifiers.Shift))
+					{
+						e.DragUIOverride.Caption = string.Format(Strings.MoveToFolderCaptionText.GetLocalizedResource(), pathBoxItem.Title);
+						// Some applications such as Edge can't raise the drop event by the Move flag (#14008), so we set the Copy flag as well.
+						e.AcceptedOperation = DataPackageOperation.Move | DataPackageOperation.Copy;
+					}
+					// Copy by default when dragging from zip
+					else if (storageItems.Any(x =>
+							x.Item is ZipStorageFile ||
+							x.Item is ZipStorageFolder) ||
+							ZipStorageFolder.IsZipPath(pathBoxItem.Path))
+					{
+						e.DragUIOverride.Caption = string.Format(Strings.CopyToFolderCaptionText.GetLocalizedResource(), pathBoxItem.Title);
+						e.AcceptedOperation = DataPackageOperation.Copy;
+					}
+					else if (storageItems.AreItemsInSameDrive(pathBoxItem.Path))
+					{
+						e.DragUIOverride.Caption = string.Format(Strings.MoveToFolderCaptionText.GetLocalizedResource(), pathBoxItem.Title);
+						// Some applications such as Edge can't raise the drop event by the Move flag (#14008), so we set the Copy flag as well.
+						e.AcceptedOperation = DataPackageOperation.Move | DataPackageOperation.Copy;
+					}
+					else
+					{
+						e.DragUIOverride.Caption = string.Format(Strings.CopyToFolderCaptionText.GetLocalizedResource(), pathBoxItem.Title);
+						e.AcceptedOperation = DataPackageOperation.Copy;
+					}
+				}
+			}
+			catch (COMException ex)
+			{
+				// The drag source can go away while the payload is read
+				App.Logger.LogWarning(ex, ex.Message);
+			}
+			finally
+			{
+				deferral.Complete();
+			}
 		}
 
 		[Obsolete("Superseded by Omnibar.")]

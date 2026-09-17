@@ -59,7 +59,10 @@ namespace Files.App.Utils.Storage
 			try
 			{
 				var destinationRoot = Path.GetPathRoot(destinationPath);
-				return itemsPath.Any(itemPath => string.Equals(Path.GetPathRoot(itemPath), destinationRoot, StringComparison.OrdinalIgnoreCase));
+
+				// Every item must share the destination root, a mixed-drive selection is not a same-drive operation
+				return itemsPath.Any() &&
+					itemsPath.All(itemPath => string.Equals(Path.GetPathRoot(itemPath), destinationRoot, StringComparison.OrdinalIgnoreCase));
 			}
 			catch
 			{

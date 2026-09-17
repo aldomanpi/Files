@@ -19,6 +19,9 @@ namespace Files.App.Utils.Storage
 		/// </summary>
 		public static string? ResolveMtpShellPath(string mtpPath)
 		{
+			if (mtpPath.Length <= 4)
+				return null;
+
 			var withoutPrefix = mtpPath.AsSpan(4);
 			var sep = withoutPrefix.IndexOf('\\');
 			var deviceName = (sep >= 0 ? withoutPrefix[..sep] : withoutPrefix).ToString();
@@ -27,8 +30,12 @@ namespace Files.App.Utils.Storage
 			{
 				unsafe
 				{
-					_deviceParsingNames[deviceName] = parsingName = FindDeviceParsingName(deviceName);
+					parsingName = FindDeviceParsingName(deviceName);
 				}
+
+				// Only successful lookups are cached, a device that wasn't enumerable yet has to be retried
+				if (parsingName is not null)
+					_deviceParsingNames[deviceName] = parsingName;
 			}
 
 			return parsingName is null ? null
@@ -46,6 +53,7 @@ namespace Files.App.Utils.Storage
 			if (hr.ThrowIfFailedOnDebug().Failed || pEnum is null)
 				return null;
 
+			string? prefixMatch = null;
 			IShellItem[] children = new IShellItem[1];
 			while (true)
 			{
@@ -61,13 +69,22 @@ namespace Files.App.Utils.Storage
 				if (name is null || !deviceName.StartsWith(name, StringComparison.OrdinalIgnoreCase))
 					continue;
 
+				var isExactMatch = deviceName.Equals(name, StringComparison.OrdinalIgnoreCase);
+				if (!isExactMatch && prefixMatch is not null)
+					continue;
+
 				pChild.GetDisplayName(SIGDN.SIGDN_DESKTOPABSOLUTEPARSING, out var szParsing);
 				var result = szParsing.ToString();
 				PInvoke.CoTaskMemFree(szParsing.Value);
-				return result;
+
+				// A shorter device name can be enumerated first, so only an exact match ends the search
+				if (isExactMatch)
+					return result;
+
+				prefixMatch = result;
 			}
 
-			return null;
+			return prefixMatch;
 		}
 	}
 }

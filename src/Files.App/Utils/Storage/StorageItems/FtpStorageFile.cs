@@ -83,12 +83,12 @@ namespace Files.App.Utils.Storage
 			return AsyncInfo.Run((cancellationToken) => SafetyExtensions.Wrap(async () =>
 			{
 				using var ftpClient = GetFtpClient();
-				if (!await ftpClient.EnsureConnectedAsync())
+				if (!await ftpClient.EnsureConnectedAsync(cancellationToken))
 				{
 					return new BaseBasicProperties();
 				}
 
-				var item = await ftpClient.GetObjectInfo(FtpPath);
+				var item = await ftpClient.GetObjectInfo(FtpPath, token: cancellationToken);
 				return item is null ? new BaseBasicProperties() : new FtpFileBasicProperties(item);
 			}, (_, _) => Task.FromResult(new BaseBasicProperties())));
 		}
@@ -98,7 +98,7 @@ namespace Files.App.Utils.Storage
 			return AsyncInfo.Run((cancellationToken) => SafetyExtensions.Wrap<IRandomAccessStream?>(async () =>
 			{
 				var ftpClient = GetFtpClient();
-				if (!await ftpClient.EnsureConnectedAsync())
+				if (!await ftpClient.EnsureConnectedAsync(cancellationToken))
 				{
 					return null;
 				}
@@ -124,7 +124,7 @@ namespace Files.App.Utils.Storage
 			return AsyncInfo.Run((cancellationToken) => SafetyExtensions.Wrap<IRandomAccessStreamWithContentType?>(async () =>
 			{
 				var ftpClient = GetFtpClient();
-				if (!await ftpClient.EnsureConnectedAsync())
+				if (!await ftpClient.EnsureConnectedAsync(cancellationToken))
 				{
 					return null;
 				}
@@ -139,7 +139,7 @@ namespace Files.App.Utils.Storage
 			return AsyncInfo.Run((cancellationToken) => SafetyExtensions.Wrap<IInputStream?>(async () =>
 			{
 				var ftpClient = GetFtpClient();
-				if (!await ftpClient.EnsureConnectedAsync())
+				if (!await ftpClient.EnsureConnectedAsync(cancellationToken))
 				{
 					return null;
 				}
@@ -161,7 +161,7 @@ namespace Files.App.Utils.Storage
 			return AsyncInfo.Run((cancellationToken) => SafetyExtensions.Wrap<BaseStorageFile?>(async () =>
 			{
 				using var ftpClient = GetFtpClient();
-				if (!await ftpClient.EnsureConnectedAsync())
+				if (!await ftpClient.EnsureConnectedAsync(cancellationToken))
 				{
 					return null;
 				}
@@ -193,15 +193,27 @@ namespace Files.App.Utils.Storage
 		{
 			return AsyncInfo.Run((cancellationToken) => SafetyExtensions.WrapAsync(async () =>
 			{
-				using var ftpClient = GetFtpClient();
-				if (!await ftpClient.EnsureConnectedAsync())
-					throw new IOException($"Failed to connect to FTP server.");
-
 				var destFolder = destinationFolder.AsBaseStorageFolder();
+				var newName = string.IsNullOrEmpty(desiredNewName) ? Name : desiredNewName;
 
 				if (destFolder is FtpStorageFolder ftpFolder)
 				{
-					string destName = $"{ftpFolder.FtpPath}/{Name}";
+					// A server side move only works within the same server, copy and delete instead
+					if (!FtpHelpers.IsSameFtpServer(Path, ftpFolder.Path))
+					{
+						var copiedFile = await CopyAsync(destinationFolder, newName, option);
+						if (copiedFile is null)
+							throw new IOException($"Failed to move file from {Path} to {ftpFolder.Path}.");
+
+						await DeleteAsync();
+						return;
+					}
+
+					using var ftpClient = GetFtpClient();
+					if (!await ftpClient.EnsureConnectedAsync(cancellationToken))
+						throw new IOException($"Failed to connect to FTP server.");
+
+					string destName = $"{ftpFolder.FtpPath}/{newName}";
 					FtpRemoteExists ftpRemoteExists = option is NameCollisionOption.ReplaceExisting ? FtpRemoteExists.Overwrite : FtpRemoteExists.Skip;
 
 					bool isSuccessful = await ftpClient.MoveFile(FtpPath, destName, ftpRemoteExists, cancellationToken);
@@ -209,7 +221,14 @@ namespace Files.App.Utils.Storage
 						throw new IOException($"Failed to move file from {Path} to {destFolder}.");
 				}
 				else
-					throw new NotSupportedException();
+				{
+					// The destination is not on an FTP server, copy and delete instead
+					var copiedFile = await CopyAsync(destinationFolder, newName, option);
+					if (copiedFile is null)
+						throw new IOException($"Failed to move file from {Path} to {destFolder?.Path}.");
+
+					await DeleteAsync();
+				}
 			}, ((IPasswordProtectedItem)this).RetryWithCredentialsAsync));
 		}
 
@@ -224,17 +243,37 @@ namespace Files.App.Utils.Storage
 			return AsyncInfo.Run((cancellationToken) => SafetyExtensions.WrapAsync(async () =>
 			{
 				using var ftpClient = GetFtpClient();
-				if (!await ftpClient.EnsureConnectedAsync())
+				if (!await ftpClient.EnsureConnectedAsync(cancellationToken))
 				{
 					return;
 				}
 
-				string destination = $"{PathNormalization.GetParentDir(FtpPath)}/{desiredName}";
+				string parentPath = PathNormalization.GetParentDir(FtpPath);
+				string finalName = desiredName;
+				string destination = $"{parentPath}/{finalName}";
+
+				if (option is NameCollisionOption.GenerateUniqueName)
+				{
+					var nameWithoutExt = IO.Path.GetFileNameWithoutExtension(desiredName);
+					var extension = IO.Path.GetExtension(desiredName);
+					ushort attempt = 1;
+
+					while (attempt < 1024 && await ftpClient.FileExists(destination, cancellationToken))
+					{
+						finalName = $"{nameWithoutExt} ({attempt}){extension}";
+						destination = $"{parentPath}/{finalName}";
+						attempt++;
+					}
+				}
+
 				var remoteExists = option is NameCollisionOption.ReplaceExisting ? FtpRemoteExists.Overwrite : FtpRemoteExists.Skip;
 				bool isSuccessful = await ftpClient.MoveFile(FtpPath, destination, remoteExists, cancellationToken);
-				if (!isSuccessful && option is NameCollisionOption.GenerateUniqueName)
+				if (!isSuccessful)
 				{
-					// TODO: handle name generation
+					if (option is not NameCollisionOption.ReplaceExisting && await ftpClient.FileExists(destination, cancellationToken))
+						throw new FileAlreadyExistsException(finalName);
+
+					throw new IOException($"Failed to rename file {Path} to {finalName}.");
 				}
 			}, ((IPasswordProtectedItem)this).RetryWithCredentialsAsync));
 		}
@@ -244,7 +283,7 @@ namespace Files.App.Utils.Storage
 			return AsyncInfo.Run((cancellationToken) => SafetyExtensions.WrapAsync(async () =>
 			{
 				using var ftpClient = GetFtpClient();
-				if (await ftpClient.EnsureConnectedAsync())
+				if (await ftpClient.EnsureConnectedAsync(cancellationToken))
 				{
 					await ftpClient.DeleteFile(FtpPath, cancellationToken);
 				}

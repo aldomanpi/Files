@@ -450,8 +450,19 @@ namespace Files.App.Views.Shells
 				return;
 			}
 
-			await FilesystemHelpers.PerformOperationTypeAsync(e.AcceptedOperation, package, destination, false, true);
-			e.SignalEvent?.Set();
+			try
+			{
+				// This is an async void handler, an escaping exception would take down the window
+				await SafetyExtensions.IgnoreExceptions(async () =>
+				{
+					await FilesystemHelpers.PerformOperationTypeAsync(e.AcceptedOperation, package, destination, false, true);
+				},
+				App.Logger);
+			}
+			finally
+			{
+				e.SignalEvent?.Set();
+			}
 		}
 
 		protected async void NavigationToolbar_QuerySubmitted(object sender, ToolbarQuerySubmittedEventArgs e)

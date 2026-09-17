@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 using DiscUtils.Udf;
+using Microsoft.Extensions.Logging;
 using Windows.Devices.Enumeration;
 using Windows.Devices.Portable;
 using Windows.Storage;
@@ -15,7 +16,14 @@ namespace Files.App.Utils.Storage
 	{
 		public static async void EjectDeviceAsync(string path)
 		{
-			await ContextMenu.InvokeVerb("eject", path);
+			// This is an async void helper, an escaping exception (e.g. for a device that was
+			// already unplugged) would take down the app
+			await SafetyExtensions.IgnoreExceptions(async () =>
+			{
+				if (!await ContextMenu.InvokeVerb("eject", path))
+					App.Logger.LogWarning("Failed to eject the device at '{Path}'.", path);
+			},
+			App.Logger);
 		}
 
 		public static async Task<bool> CheckEmptyDrive(string? drivePath)

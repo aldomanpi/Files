@@ -49,7 +49,7 @@ namespace Files.App.Utils.Storage.Operations
 				{
 					queue.Enqueue(path);
 
-					while (queue.TryDequeue(out var directory))
+					while (!token.IsCancellationRequested && queue.TryDequeue(out var directory))
 					{
 						WIN32_FIND_DATAW findData = default;
 

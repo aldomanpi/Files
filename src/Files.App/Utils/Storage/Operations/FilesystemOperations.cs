@@ -274,7 +274,10 @@ namespace Files.App.Utils.Storage
 						}
 						else
 						{
-							fsResultCopy = await FilesystemTasks.WrapNullable(() => file.CopyAsync(destinationFolder, Path.GetFileName(file.Name)!, collision).AsTask());
+							// The destination name can differ from the source name (e.g. when restoring from the recycle bin)
+							string newName = Path.GetFileName(destination) is { Length: > 0 } destinationName ? destinationName : file.Name;
+
+							fsResultCopy = await FilesystemTasks.WrapNullable(() => file.CopyAsync(destinationFolder, newName, collision).AsTask());
 						}
 
 						if (file is IPasswordProtectedItem ppiu)
@@ -368,6 +371,7 @@ namespace Files.App.Utils.Storage
 			}
 
 			IStorageItem? movedItem = null;
+			bool clonedInsteadOfMoved = false;
 
 			if (source.ItemType == FilesystemItemType.Directory)
 			{
@@ -425,7 +429,11 @@ namespace Files.App.Utils.Storage
 								//var fsResultMove = await FilesystemTasks.Wrap(() => MoveDirectoryAsync((BaseStorageFolder)fsSourceFolder, (BaseStorageFolder)fsDestinationFolder, fsSourceFolder.Result.Name, collision.Convert(), true));
 
 								if (await DialogDisplayHelper.ShowDialogAsync(Strings.ErrorDialogThisActionCannotBeDone.GetLocalizedResource(), Strings.ErrorDialogUnsupportedMoveOperation.GetLocalizedResource(), "OK", Strings.Cancel.GetLocalizedResource()))
+								{
+									// The source folder is cloned and left in place, so this is a copy and not a move
+									clonedInsteadOfMoved = true;
 									fsResultMove = await FilesystemTasks.Wrap(() => CloneDirectoryAsync(sourceFolder, destinationFolder, sourceFolder.Name, collision.Convert()));
+								}
 							}
 
 							if (sourceFolder is IPasswordProtectedItem ppiu)
@@ -485,7 +493,10 @@ namespace Files.App.Utils.Storage
 						if (file is IPasswordProtectedItem ppis)
 							ppis.PasswordRequestedCallback = UIFilesystemHelpers.RequestPassword;
 
-						var fsResultMove = await FilesystemTasks.Wrap(() => file.MoveAsync(destinationFolder, Path.GetFileName(file.Name)!, collision).AsTask());
+						// The destination name can differ from the source name (e.g. when restoring from the recycle bin)
+						string newName = Path.GetFileName(destination) is { Length: > 0 } destinationName ? destinationName : file.Name;
+
+						var fsResultMove = await FilesystemTasks.Wrap(() => file.MoveAsync(destinationFolder, newName, collision).AsTask());
 
 						if (file is IPasswordProtectedItem ppiu)
 							ppiu.PasswordRequestedCallback = null;
@@ -497,9 +508,8 @@ namespace Files.App.Utils.Storage
 							return null;
 						}
 
-						if (fsResultMove)
-							movedItem = file;
-
+						// Leave the moved item unresolved so the history destination is built from the destination path,
+						// the source item would resolve back to the source path and make undo a no-op
 						fsResult = fsResultMove;
 					}
 					else if (fsResult)
@@ -514,6 +524,10 @@ namespace Files.App.Utils.Storage
 				fsProgress.ReportStatus(fsResult.ErrorCode);
 			}
 
+			// The operation failed, there's nothing to undo
+			if (fsProgress.Status != FileSystemStatusCode.Success)
+				return null;
+
 			if (collision == NameCollisionOption.ReplaceExisting)
 			{
 				// Cannot undo overwrite operation
@@ -521,7 +535,7 @@ namespace Files.App.Utils.Storage
 			}
 
 			bool sourceInCurrentFolder = PathNormalization.TrimPath(ShellViewModel.CurrentFolder?.ItemPath) == PathNormalization.GetParentDir(source.Path);
-			if (fsProgress.Status == FileSystemStatusCode.Success && sourceInCurrentFolder)
+			if (fsProgress.Status == FileSystemStatusCode.Success && sourceInCurrentFolder && !clonedInsteadOfMoved)
 			{
 				await ShellViewModel.RemoveFileOrFolderAsync(source.Path);
 				await ShellViewModel.ApplyFilesAndFoldersChangesAsync();
@@ -529,7 +543,7 @@ namespace Files.App.Utils.Storage
 
 			var pathWithType = movedItem.FromStorageItem(destination, source.ItemType);
 
-			return new StorageHistory(FileOperationType.Move, source, pathWithType);
+			return new StorageHistory(clonedInsteadOfMoved ? FileOperationType.Copy : FileOperationType.Move, source, pathWithType);
 		}
 
 		public Task<IStorageHistory?> DeleteAsync(IStorageItem source, IProgress<StatusCenterItemProgressModel>? progress, bool permanently, CancellationToken cancellationToken)
@@ -947,7 +961,7 @@ namespace Files.App.Utils.Storage
 						source[i],
 						destination[i],
 						collisions[i].Convert(),
-						null,
+						progress,
 						token));
 				}
 
@@ -979,6 +993,7 @@ namespace Files.App.Utils.Storage
 			fsProgress.Report();
 
 			var rawStorageHistory = new List<IStorageHistory?>();
+			var anyItemFailed = false;
 
 			for (int i = 0; i < source.Count; i++)
 			{
@@ -989,21 +1004,39 @@ namespace Files.App.Utils.Storage
 
 				if (collisions[i] != FileNameConflictResolveOptionType.Skip)
 				{
-					rawStorageHistory.Add(await MoveAsync(
+					var itemHistory = await MoveAsync(
 						source[i],
 						destination[i],
 						collisions[i].Convert(),
-						null,
-						token));
+						progress,
+						token);
+
+					rawStorageHistory.Add(itemHistory);
+
+					// Moving an item onto itself and overwriting an existing item are the only cases that succeed without a history
+					if (itemHistory is null &&
+						source[i].Path != destination[i] &&
+						collisions[i] != FileNameConflictResolveOptionType.ReplaceExisting)
+						anyItemFailed = true;
 				}
 
 				fsProgress.AddProcessedItemsCount(1);
 				fsProgress.Report();
 			}
 
+			// The move banner lets a later successful item override an earlier failure, so report the failure last
+			if (anyItemFailed && !token.IsCancellationRequested)
+				fsProgress.ReportStatus(FileSystemStatusCode.Generic);
+
 			if (rawStorageHistory.Count > 0 && rawStorageHistory.All(item => item is not null))
 			{
 				var storageHistory = rawStorageHistory.WhereNotNull().ToList();
+
+				// Items that were cloned instead of moved are reported as a copy, undoing a mixed batch
+				// as a single operation would delete the moved items, so don't provide any history
+				if (storageHistory.Any(item => item.OperationType != storageHistory[0].OperationType))
+					return null;
+
 				return new StorageHistory(
 					storageHistory[0].OperationType,
 					await storageHistory.SelectMany(item => item.Source).ToListAsync(),
@@ -1033,7 +1066,7 @@ namespace Files.App.Utils.Storage
 
 				permanently = StorageTrashBinService.IsUnderTrashBin(source[i].Path) || originalPermanently;
 
-				rawStorageHistory.Add(await DeleteAsync(source[i], null, permanently, token));
+				rawStorageHistory.Add(await DeleteAsync(source[i], progress, permanently, token));
 				fsProgress.AddProcessedItemsCount(1);
 				fsProgress.Report();
 			}

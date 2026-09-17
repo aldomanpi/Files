@@ -1,6 +1,7 @@
 // Copyright (c) Files Community
 // Licensed under the MIT License.
 
+using Microsoft.Extensions.Logging;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
@@ -40,31 +41,46 @@ namespace Files.App.UserControls
 			if (ItemsSource is null)
 				return;
 
-			// Get items
-			var storageService = Ioc.Default.GetRequiredService<IStorageService>();
-			var storageItems = (await FilesystemHelpers.GetDraggedStorageItems(e.DataView)).ToArray();
+			// The payload has to be read before the drag operation ends, so the drop is deferred
+			var deferral = e.GetDeferral();
 
-			// Add to list
-			foreach (var item in storageItems)
+			try
 			{
-				// Avoid adding duplicates
-				if (ItemsSource.Any(x => x.Inner.Id == item.Path))
-					continue;
+				// Get items
+				var storageService = Ioc.Default.GetRequiredService<IStorageService>();
+				var storageItems = (await FilesystemHelpers.GetDraggedStorageItems(e.DataView)).ToArray();
 
-				var storable = item switch
+				// Add to list
+				foreach (var item in storageItems)
 				{
-					StorageFileWithPath => (IStorableChild?)await storageService.TryGetFileAsync(item.Path),
-					StorageFolderWithPath => (IStorableChild?)await storageService.TryGetFolderAsync(item.Path),
-					_ => null
-				};
+					// Avoid adding duplicates
+					if (ItemsSource.Any(x => x.Inner.Id == item.Path))
+						continue;
 
-				if (storable is null)
-					continue;
+					var storable = item switch
+					{
+						StorageFileWithPath => (IStorableChild?)await storageService.TryGetFileAsync(item.Path),
+						StorageFolderWithPath => (IStorableChild?)await storageService.TryGetFolderAsync(item.Path),
+						_ => null
+					};
 
-				var shelfItem = new ShelfItem(storable, ItemsSource);
-				_ = shelfItem.InitAsync();
+					if (storable is null)
+						continue;
 
-				ItemsSource.Add(shelfItem);
+					var shelfItem = new ShelfItem(storable, ItemsSource);
+					_ = shelfItem.InitAsync();
+
+					ItemsSource.Add(shelfItem);
+				}
+			}
+			catch (Exception ex)
+			{
+				// This is an async void handler, an escaping exception would take down the window
+				App.Logger.LogWarning(ex, ex.Message);
+			}
+			finally
+			{
+				deferral.Complete();
 			}
 		}
 

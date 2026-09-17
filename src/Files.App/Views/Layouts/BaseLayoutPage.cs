@@ -6,6 +6,7 @@ using Files.App.Controls;
 using Files.App.Helpers.ContextFlyouts;
 using Files.App.UserControls.Menus;
 using Files.App.ViewModels.Layouts;
+using Microsoft.Extensions.Logging;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
@@ -1190,6 +1191,11 @@ namespace Files.App.Views.Layouts
 						TimeSpan.FromMilliseconds(Constants.DragAndDrop.HoverToOpenTimespan), false);
 					}
 				}
+			}
+			catch (Exception ex)
+			{
+				// This is an async void handler, an escaping exception would take down the window
+				App.Logger.LogWarning(ex, ex.Message);
 			}
 			finally
 			{

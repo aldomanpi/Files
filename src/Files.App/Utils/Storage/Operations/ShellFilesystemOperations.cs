@@ -78,7 +78,7 @@ namespace Files.App.Utils.Storage
 
 			if (sourceRename.Any())
 			{
-				var resultItem = await FileOperationsHelpers.CopyItemAsync(sourceRename.Select(s => s.Path).ToArray(), destinationRename.ToArray(), false, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID);
+				var resultItem = await FileOperationsHelpers.CopyItemAsync(sourceRename.Select(s => s.Path).ToArray(), destinationRename.ToArray(), false, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID, cancellationToken);
 
 				result &= (FilesystemResult)resultItem.Item1;
 
@@ -87,11 +87,19 @@ namespace Files.App.Utils.Storage
 
 			if (sourceReplace.Any())
 			{
-				var resultItem = await FileOperationsHelpers.CopyItemAsync(sourceReplace.Select(s => s.Path).ToArray(), destinationReplace.ToArray(), true, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID);
+				// A cancellation during the first batch must not start the second one
+				if (cancellationToken.IsCancellationRequested)
+				{
+					result &= (FilesystemResult)false;
+				}
+				else
+				{
+					var resultItem = await FileOperationsHelpers.CopyItemAsync(sourceReplace.Select(s => s.Path).ToArray(), destinationReplace.ToArray(), true, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID, cancellationToken);
 
-				result &= (FilesystemResult)resultItem.Item1;
+					result &= (FilesystemResult)resultItem.Item1;
 
-				copyResult.Items.AddRange(resultItem.Item2?.Final ?? Enumerable.Empty<ShellOperationItemResult>());
+					copyResult.Items.AddRange(resultItem.Item2?.Final ?? Enumerable.Empty<ShellOperationItemResult>());
+				}
 			}
 
 			result &= (FilesystemResult)copyResult.Items.All(x => x.Succeeded);
@@ -355,7 +363,7 @@ namespace Files.App.Utils.Storage
 
 		public async Task<IStorageHistory?> DeleteItemsAsync(IList<IStorageItemWithPath> source, IProgress<StatusCenterItemProgressModel>? progress, bool permanently, CancellationToken cancellationToken, bool asAdmin = false)
 		{
-			if (source.Any(x => string.IsNullOrWhiteSpace(x.Path) || x.Path.StartsWith(@"\\?\", StringComparison.Ordinal) || FtpHelpers.IsFtpPath(x.Path)))
+			if (source.Any(x => string.IsNullOrWhiteSpace(x.Path) || x.Path.StartsWith(@"\\?\", StringComparison.Ordinal) || FtpHelpers.IsFtpPath(x.Path) || ZipStorageFolder.IsZipPath(x.Path, false)))
 			{
 				// Fallback to built-in file operations
 				return await _filesystemOperations.DeleteItemsAsync(source, progress, permanently, cancellationToken);
@@ -383,7 +391,7 @@ namespace Files.App.Utils.Storage
 			var operationID = Guid.NewGuid().ToString();
 			await using var r = cancellationToken.Register(CancelOperation, operationID, false);
 
-			var (success, response) = await FileOperationsHelpers.DeleteItemAsync(deleteFilePaths.ToArray(), permanently, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID);
+			var (success, response) = await FileOperationsHelpers.DeleteItemAsync(deleteFilePaths.ToArray(), permanently, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID, cancellationToken);
 
 			var result = (FilesystemResult)success;
 			var deleteResult = new ShellOperationResult();
@@ -497,9 +505,15 @@ namespace Files.App.Utils.Storage
 				?? throw new InvalidOperationException("A storage item could not be converted for moving.")).ToListAsync(), destination, collisions, progress, cancellationToken);
 		}
 
-		public async Task<IStorageHistory?> MoveItemsAsync(IList<IStorageItemWithPath> source, IList<string> destination, IList<FileNameConflictResolveOptionType> collisions, IProgress<StatusCenterItemProgressModel> progress, CancellationToken cancellationToken, bool asAdmin = false)
+		public Task<IStorageHistory?> MoveItemsAsync(IList<IStorageItemWithPath> source, IList<string> destination, IList<FileNameConflictResolveOptionType> collisions, IProgress<StatusCenterItemProgressModel> progress, CancellationToken cancellationToken, bool asAdmin = false)
 		{
-			if (source.Any(x => string.IsNullOrWhiteSpace(x.Path) || x.Path.StartsWith(@"\\?\", StringComparison.Ordinal)) || destination.Any(x => string.IsNullOrWhiteSpace(x) || x.StartsWith(@"\\?\", StringComparison.Ordinal) || FtpHelpers.IsFtpPath(x) || ZipStorageFolder.IsZipPath(x, false)))
+			return MoveItemsAsync(source, destination, collisions, progress, cancellationToken, asAdmin, false);
+		}
+
+		private async Task<IStorageHistory?> MoveItemsAsync(IList<IStorageItemWithPath> source, IList<string> destination, IList<FileNameConflictResolveOptionType> collisions, IProgress<StatusCenterItemProgressModel> progress, CancellationToken cancellationToken, bool asAdmin, bool retryingWithoutProperties)
+		{
+			if (source.Any(x => string.IsNullOrWhiteSpace(x.Path) || x.Path.StartsWith(@"\\?\", StringComparison.Ordinal) || FtpHelpers.IsFtpPath(x.Path) || ZipStorageFolder.IsZipPath(x.Path, false))
+				|| destination.Any(x => string.IsNullOrWhiteSpace(x) || x.StartsWith(@"\\?\", StringComparison.Ordinal) || FtpHelpers.IsFtpPath(x) || ZipStorageFolder.IsZipPath(x, false)))
 			{
 				// Fallback to built-in file operations
 				return await _filesystemOperations.MoveItemsAsync(source, destination, collisions, progress, cancellationToken);
@@ -529,7 +543,7 @@ namespace Files.App.Utils.Storage
 
 			if (sourceRename.Any())
 			{
-				var (status, response) = await FileOperationsHelpers.MoveItemAsync(sourceRename.Select(s => s.Path).ToArray(), destinationRename.ToArray(), false, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID);
+				var (status, response) = await FileOperationsHelpers.MoveItemAsync(sourceRename.Select(s => s.Path).ToArray(), destinationRename.ToArray(), false, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID, cancellationToken);
 
 				result &= (FilesystemResult)status;
 				moveResult.Items.AddRange(response?.Final ?? Enumerable.Empty<ShellOperationItemResult>());
@@ -537,10 +551,18 @@ namespace Files.App.Utils.Storage
 
 			if (sourceReplace.Any())
 			{
-				var (status, response) = await FileOperationsHelpers.MoveItemAsync(sourceReplace.Select(s => s.Path).ToArray(), destinationReplace.ToArray(), true, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID);
+				// A cancellation during the first batch must not start the second one
+				if (cancellationToken.IsCancellationRequested)
+				{
+					result &= (FilesystemResult)false;
+				}
+				else
+				{
+					var (status, response) = await FileOperationsHelpers.MoveItemAsync(sourceReplace.Select(s => s.Path).ToArray(), destinationReplace.ToArray(), true, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID, cancellationToken);
 
-				result &= (FilesystemResult)status;
-				moveResult.Items.AddRange(response?.Final ?? Enumerable.Empty<ShellOperationItemResult>());
+					result &= (FilesystemResult)status;
+					moveResult.Items.AddRange(response?.Final ?? Enumerable.Empty<ShellOperationItemResult>());
+				}
 			}
 
 			result &= (FilesystemResult)moveResult.Items.All(x => x.Succeeded);
@@ -570,7 +592,7 @@ namespace Files.App.Utils.Storage
 				if (moveResult.Items.Any(x => CopyEngineResult.Convert(x.HResult) == FileSystemStatusCode.Unauthorized))
 				{
 					if (!asAdmin && await RequestAdminOperation())
-						return await MoveItemsAsync(source, destination, collisions, progress, cancellationToken, true);
+						return await MoveItemsAsync(source, destination, collisions, progress, cancellationToken, true, retryingWithoutProperties);
 				}
 				else if (source.Zip(destination, (src, dest) => (src, dest)).FirstOrDefault(x => x.src.ItemType == FilesystemItemType.Directory && PathNormalization.GetParentDir(x.dest).IsSubPathOf(x.src.Path)) is (IStorageItemWithPath, string) subtree)
 				{
@@ -619,19 +641,23 @@ namespace Files.App.Utils.Storage
 				}
 				else if (moveResult.Items.Any(x => CopyEngineResult.Convert(x.HResult) == FileSystemStatusCode.PropertyLoss))
 				{
-					var failedSources = moveResult.Items.Where(x => CopyEngineResult.Convert(x.HResult) == FileSystemStatusCode.PropertyLoss);
-					var filePath = failedSources.Select(x => x.Source).WhereNotNull();
-					switch (await GetFileListDialog(filePath, Strings.FilePropertiesCannotBeMoved.GetLocalizedResource(), Strings.MoveFileWithoutProperties.GetLocalizedResource(), Strings.OK.GetLocalizedResource(), Strings.Cancel.GetLocalizedResource()))
+					// This is already the retry that accepts the property loss, so don't ask again when that wasn't enough
+					if (!retryingWithoutProperties)
 					{
-						case DialogResult.Primary:
-							var copyZip = sourceNoSkip.Zip(destinationNoSkip, (src, dest) => new { src, dest }).Zip(collisionsNoSkip, (z1, coll) => new { z1.src, z1.dest, coll });
-							var sourceMatch = await failedSources.Select(x => copyZip.SingleOrDefault(s => s.src.Path.Equals(x.Source, StringComparison.OrdinalIgnoreCase))).WhereNotNull().ToListAsync();
-							return await CopyItemsAsync(
-								await sourceMatch.Select(x => x.src).ToListAsync(),
-								await sourceMatch.Select(x => x.dest).ToListAsync(),
-								// Force collision option to "replace" to accept moving with property loss
-								// Ok since property loss error is raised after checking if the destination already exists
-								await sourceMatch.Select(x => FileNameConflictResolveOptionType.ReplaceExisting).ToListAsync(), progress, cancellationToken);
+						var failedSources = moveResult.Items.Where(x => CopyEngineResult.Convert(x.HResult) == FileSystemStatusCode.PropertyLoss);
+						var filePath = failedSources.Select(x => x.Source).WhereNotNull();
+						switch (await GetFileListDialog(filePath, Strings.FilePropertiesCannotBeMoved.GetLocalizedResource(), Strings.MoveFileWithoutProperties.GetLocalizedResource(), Strings.OK.GetLocalizedResource(), Strings.Cancel.GetLocalizedResource()))
+						{
+							case DialogResult.Primary:
+								var moveZip = sourceNoSkip.Zip(destinationNoSkip, (src, dest) => new { src, dest }).Zip(collisionsNoSkip, (z1, coll) => new { z1.src, z1.dest, coll });
+								var sourceMatch = await failedSources.Select(x => moveZip.SingleOrDefault(s => s.src.Path.Equals(x.Source, StringComparison.OrdinalIgnoreCase))).WhereNotNull().ToListAsync();
+								return await MoveItemsAsync(
+									await sourceMatch.Select(x => x.src).ToListAsync(),
+									await sourceMatch.Select(x => x.dest).ToListAsync(),
+									// Force collision option to "replace" to accept moving with property loss
+									// Ok since property loss error is raised after checking if the destination already exists
+									await sourceMatch.Select(x => FileNameConflictResolveOptionType.ReplaceExisting).ToListAsync(), progress, cancellationToken, asAdmin, true);
+						}
 					}
 				}
 				else if (moveResult.Items.All(x => x.HResult == -1)) // ADS
@@ -780,7 +806,7 @@ namespace Files.App.Utils.Storage
 			await using var r = cancellationToken.Register(CancelOperation, operationID, false);
 
 			var moveResult = new ShellOperationResult();
-			var (status, response) = await FileOperationsHelpers.MoveItemAsync(source.Select(s => s.Path).ToArray(), [.. destination], false, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID);
+			var (status, response) = await FileOperationsHelpers.MoveItemAsync(source.Select(s => s.Path).ToArray(), [.. destination], false, MainWindow.Instance.WindowHandle.ToInt64(), asAdmin, progress, operationID, cancellationToken);
 
 			var result = (FilesystemResult)status;
 			moveResult.Items.AddRange(response?.Final ?? Enumerable.Empty<ShellOperationItemResult>());

@@ -385,11 +385,11 @@ namespace Files.App.Utils.Storage
 					if (StorageTrashBinService.IsUnderTrashBin(item.Path))
 					{
 						binItems ??= await StorageTrashBinService.GetAllRecycleBinFoldersAsync();
-						if (!binItems.IsEmpty()) // Might still be null because we're deserializing the list from Json
-						{
-							var matchingItem = binItems.FirstOrDefault(x => x.RecyclePath == item.Path); // Get original file name
-							destinations.Add(PathNormalization.Combine(destination, matchingItem?.FileName ?? item.Name));
-						}
+
+						// Get the original file name, the list might be empty because we're deserializing it from Json.
+						// A destination must be added for every source, otherwise the two lists get out of sync.
+						var matchingItem = binItems.FirstOrDefault(x => x.RecyclePath == item.Path);
+						destinations.Add(PathNormalization.Combine(destination, matchingItem?.FileName ?? item.Name));
 					}
 					else
 					{
@@ -477,10 +477,12 @@ namespace Files.App.Utils.Storage
 
 			IStorageHistory? history = await filesystemOperations.MoveItemsAsync((IList<IStorageItemWithPath>)source, (IList<string>)destination, collisions, banner.ProgressEventSource, token);
 
+			// Progress callbacks are posted to the UI thread, so let the pending ones run before reading the
+			// status below, otherwise a failure they report would be overridden by the success reported here
+			await Task.Yield();
+
 			if (returnStatus == ReturnResult.InProgress || returnStatus == ReturnResult.Success)
 				banner.Progress.ReportStatus(FileSystemStatusCode.Success);
-
-			await Task.Yield();
 
 			if (registerHistory &&
 				history?.Destination is { } historyDestinations &&
@@ -490,7 +492,7 @@ namespace Files.App.Utils.Storage
 				{
 					foreach (var conflictItem in itemsResult)
 					{
-						if (!string.IsNullOrEmpty(conflictItem.CustomName) && conflictItem.SourcePath == histSrcItem.Path)
+						if (!string.IsNullOrEmpty(conflictItem.CustomName) && conflictItem.SourcePath == histSrcItem.Path && Path.GetFileName(conflictItem.SourcePath) != conflictItem.CustomName)
 						{
 							var renameHistory = await filesystemOperations.RenameAsync(histDestItem, conflictItem.CustomName, NameCollisionOption.FailIfExists, banner.ProgressEventSource, token);
 							if (renameHistory?.Destination is { Count: > 0 } renameDestinations)
@@ -541,11 +543,11 @@ namespace Files.App.Utils.Storage
 				if (StorageTrashBinService.IsUnderTrashBin(item.Path))
 				{
 					binItems ??= await StorageTrashBinService.GetAllRecycleBinFoldersAsync();
-					if (!binItems.IsEmpty()) // Might still be null because we're deserializing the list from Json
-					{
-						var matchingItem = binItems.FirstOrDefault(x => x.RecyclePath == item.Path); // Get original file name
-						destinations.Add(PathNormalization.Combine(destination, matchingItem?.FileName ?? item.Name));
-					}
+
+					// Get the original file name, the list might be empty because we're deserializing it from Json.
+					// A destination must be added for every source, otherwise the two lists get out of sync.
+					var matchingItem = binItems.FirstOrDefault(x => x.RecyclePath == item.Path);
+					destinations.Add(PathNormalization.Combine(destination, matchingItem?.FileName ?? item.Name));
 				}
 				else
 				{
@@ -672,11 +674,51 @@ namespace Files.App.Utils.Storage
 		public static bool IsValidForFilename(string name)
 			=> !string.IsNullOrWhiteSpace(name) && !ContainsRestrictedCharacters(name) && !ContainsRestrictedFileName(name);
 
+		/// <summary>
+		/// Checks whether an item already exists at <paramref name="destination"/>.
+		/// </summary>
+		/// <remarks>
+		/// FTP and MTP destinations are not reachable through the file attribute check, so they are resolved through their storage layer instead.
+		/// </remarks>
+		/// <param name="parentFolders">Caches the resolved parent folders, since every lookup on a device is a round-trip.</param>
+		private static async Task<bool> DestinationExistsAsync(string destination, Dictionary<string, BaseStorageFolder?> parentFolders)
+		{
+			if (FtpHelpers.IsFtpPath(destination))
+			{
+				var ftpStorageService = Ioc.Default.GetRequiredService<IFtpStorageService>();
+
+				return await ftpStorageService.TryGetFileAsync(destination) is not null ||
+					await ftpStorageService.TryGetFolderAsync(destination) is not null;
+			}
+
+			if (destination.StartsWith("\\\\?\\", StringComparison.Ordinal))
+			{
+				var parentPath = PathNormalization.GetParentDir(destination);
+				if (!parentFolders.TryGetValue(parentPath, out var cachedFolder))
+				{
+					var parentResult = await FilesystemTasks.WrapNullable(() => BaseStorageFolder.GetFolderFromPathAsync(parentPath).AsTask());
+					cachedFolder = parentResult.Result;
+					parentFolders.Add(parentPath, cachedFolder);
+				}
+
+				// Without a parent folder there can't be an item at the destination
+				if (cachedFolder is not BaseStorageFolder parentFolder)
+					return false;
+
+				var itemResult = await FilesystemTasks.WrapNullable(() => parentFolder.TryGetItemAsync(Path.GetFileName(destination)).AsTask());
+
+				return itemResult.Result is not null;
+			}
+
+			return StorageHelpers.Exists(destination);
+		}
+
 		private static async Task<(List<FileNameConflictResolveOptionType> collisions, bool cancelOperation, IEnumerable<IFileSystemDialogConflictItemViewModel>)> GetCollisions(FilesystemOperationType operationType, IEnumerable<IStorageItemWithPath> source, IEnumerable<string> destination, bool forceDialog)
 		{
 			var nonConflictingItems = new List<BaseFileSystemDialogItemViewModel>();
 			var conflictingItems = new List<BaseFileSystemDialogItemViewModel>();
 			var collisions = new Dictionary<string, FileNameConflictResolveOptionType>();
+			var parentFolders = new Dictionary<string, BaseStorageFolder?>(StringComparer.OrdinalIgnoreCase);
 
 			foreach (var (src, dest) in source.Zip(destination))
 			{
@@ -700,9 +742,7 @@ namespace Files.App.Utils.Storage
 				if (string.IsNullOrEmpty(src.Path) || src.Path != dest)
 				{
 					// Same item names in both directories
-					if (StorageHelpers.Exists(dest) ||
-						(FtpHelpers.IsFtpPath(dest) &&
-						await Ioc.Default.GetRequiredService<IFtpStorageService>().TryGetFileAsync(dest) is not null))
+					if (await DestinationExistsAsync(dest, parentFolders))
 					{
 						incomingItem.ConflictResolveOption = FileNameConflictResolveOptionType.GenerateNewName;
 						conflictingItems.Add(incomingItem);

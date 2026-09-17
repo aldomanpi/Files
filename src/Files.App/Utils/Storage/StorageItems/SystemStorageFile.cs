@@ -155,8 +155,13 @@ namespace Files.App.Utils.Storage
 					await File.MoveAsync(sysFolder.Folder, desiredNewName, option);
 					return;
 				}
-				await CopyAsync(destinationFolder, desiredNewName, option);
-				// Move unsupported, copy but do not delete original
+				// Move unsupported, copy and then delete the original so move semantics still hold.
+				// The original is left untouched when the copy fails.
+				var copiedFile = await CopyAsync(destinationFolder, desiredNewName, option);
+				if (copiedFile is null)
+					throw new IOException($"Failed to move file '{Name}' to '{desiredNewName}'.");
+
+				await File.DeleteAsync();
 			});
 		}
 

@@ -23,7 +23,7 @@ namespace Files.App.Helpers
 				if (statusCenterItem is not null)
 				{
 					statusCenterItem.Progress.EnumerationCompleted = true;
-					statusCenterItem.Progress.ItemsCount = items.Count;
+					statusCenterItem.Progress.ItemsCount = itemsCount;
 					statusCenterItem.Progress.ReportStatus(FileSystemStatusCode.InProgress);
 				}
 
@@ -101,7 +101,7 @@ namespace Files.App.Helpers
 				if (statusCenterItem is not null)
 				{
 					statusCenterItem.Progress.EnumerationCompleted = true;
-					statusCenterItem.Progress.ItemsCount = items.Count;
+					statusCenterItem.Progress.ItemsCount = itemsCount;
 					statusCenterItem.Progress.ReportStatus(FileSystemStatusCode.InProgress);
 				}
 

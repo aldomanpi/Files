@@ -8,11 +8,11 @@ namespace Files.App.Utils.Storage
 {
 	public static class FtpHelpers
 	{
-		public static async Task<bool> EnsureConnectedAsync(this AsyncFtpClient ftpClient)
+		public static async Task<bool> EnsureConnectedAsync(this AsyncFtpClient ftpClient, CancellationToken cancellationToken = default)
 		{
 			if (!ftpClient.IsConnected)
 			{
-				await ftpClient.Connect();
+				await ftpClient.Connect(cancellationToken);
 			}
 
 			return true;
@@ -54,6 +54,13 @@ namespace Files.App.Utils.Storage
 				return path.StartsWith("ftps://", StringComparison.OrdinalIgnoreCase) ? (ushort)990 : (ushort)21;
 
 			return ushort.Parse(authority.Substring(index + 1));
+		}
+
+		public static bool IsSameFtpServer(string firstPath, string secondPath)
+		{
+			return
+				string.Equals(GetFtpHost(firstPath), GetFtpHost(secondPath), StringComparison.OrdinalIgnoreCase) &&
+				GetFtpPort(firstPath) == GetFtpPort(secondPath);
 		}
 
 		public static string GetFtpAuthority(string path)
