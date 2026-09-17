@@ -161,7 +161,8 @@ namespace Files.App.Utils.Storage
 				if (copiedFile is null)
 					throw new IOException($"Failed to move file '{Name}' to '{desiredNewName}'.");
 
-				await File.DeleteAsync();
+				// Recycling the source would leave a full copy behind, the item was already cloned to the destination
+				await File.DeleteAsync(StorageDeleteOption.PermanentDelete);
 			});
 		}
 

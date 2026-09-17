@@ -11,7 +11,9 @@ namespace Files.App.Utils.Storage
 {
 	public static class MtpHelpers
 	{
-		private static readonly ConcurrentDictionary<string, string?> _deviceParsingNames = new(StringComparer.OrdinalIgnoreCase);
+		private static readonly ConcurrentDictionary<string, DeviceLookup> _deviceParsingNames = new(StringComparer.OrdinalIgnoreCase);
+
+		private static readonly TimeSpan NegativeCacheDuration = TimeSpan.FromSeconds(5);
 
 		/// <summary>
 		/// Resolves a <c>\\?\DeviceName\path</c> to a shell Portable Devices namespace path
@@ -26,17 +28,21 @@ namespace Files.App.Utils.Storage
 			var sep = withoutPrefix.IndexOf('\\');
 			var deviceName = (sep >= 0 ? withoutPrefix[..sep] : withoutPrefix).ToString();
 
-			if (!_deviceParsingNames.TryGetValue(deviceName, out var parsingName))
+			// A device that wasn't enumerable yet has to be retried, but only after the negative entry expires
+			if (!_deviceParsingNames.TryGetValue(deviceName, out var lookup) ||
+				(lookup.ParsingName is null && DateTime.UtcNow - lookup.ProbedAt >= NegativeCacheDuration))
 			{
+				string? probedName;
 				unsafe
 				{
-					parsingName = FindDeviceParsingName(deviceName);
+					probedName = FindDeviceParsingName(deviceName);
 				}
 
-				// Only successful lookups are cached, a device that wasn't enumerable yet has to be retried
-				if (parsingName is not null)
-					_deviceParsingNames[deviceName] = parsingName;
+				lookup = new DeviceLookup(probedName, DateTime.UtcNow);
+				_deviceParsingNames[deviceName] = lookup;
 			}
+
+			var parsingName = lookup.ParsingName;
 
 			return parsingName is null ? null
 				: sep >= 0 ? Path.Combine(parsingName, withoutPrefix[(sep + 1)..].ToString())
@@ -86,5 +92,10 @@ namespace Files.App.Utils.Storage
 
 			return prefixMatch;
 		}
+
+		/// <summary>
+		/// Represents the outcome of a device lookup, a null <c>ParsingName</c> marks a failed probe.
+		/// </summary>
+		private readonly record struct DeviceLookup(string? ParsingName, DateTime ProbedAt);
 	}
 }

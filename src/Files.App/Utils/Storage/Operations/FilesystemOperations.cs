@@ -993,7 +993,7 @@ namespace Files.App.Utils.Storage
 			fsProgress.Report();
 
 			var rawStorageHistory = new List<IStorageHistory?>();
-			var anyItemFailed = false;
+			var observer = new FailureObservingProgress(progress);
 
 			for (int i = 0; i < source.Count; i++)
 			{
@@ -1004,20 +1004,12 @@ namespace Files.App.Utils.Storage
 
 				if (collisions[i] != FileNameConflictResolveOptionType.Skip)
 				{
-					var itemHistory = await MoveAsync(
+					rawStorageHistory.Add(await MoveAsync(
 						source[i],
 						destination[i],
 						collisions[i].Convert(),
-						progress,
-						token);
-
-					rawStorageHistory.Add(itemHistory);
-
-					// Moving an item onto itself and overwriting an existing item are the only cases that succeed without a history
-					if (itemHistory is null &&
-						source[i].Path != destination[i] &&
-						collisions[i] != FileNameConflictResolveOptionType.ReplaceExisting)
-						anyItemFailed = true;
+						observer,
+						token));
 				}
 
 				fsProgress.AddProcessedItemsCount(1);
@@ -1025,7 +1017,7 @@ namespace Files.App.Utils.Storage
 			}
 
 			// The move banner lets a later successful item override an earlier failure, so report the failure last
-			if (anyItemFailed && !token.IsCancellationRequested)
+			if (observer.AnyFailed && !token.IsCancellationRequested)
 				fsProgress.ReportStatus(FileSystemStatusCode.Generic);
 
 			if (rawStorageHistory.Count > 0 && rawStorageHistory.All(item => item is not null))
@@ -1105,6 +1097,35 @@ namespace Files.App.Utils.Storage
 		public void Dispose()
 		{
 			_associatedInstance = null;
+		}
+
+		/// <summary>
+		/// Forwards every progress report while recording whether any of them reported a failing status.
+		/// </summary>
+		private sealed class FailureObservingProgress : IProgress<StatusCenterItemProgressModel>
+		{
+			private readonly IProgress<StatusCenterItemProgressModel>? _progress;
+
+			/// <summary>
+			/// Gets a value indicating whether any reported status was neither in progress nor successful.
+			/// </summary>
+			public bool AnyFailed { get; private set; }
+
+			public FailureObservingProgress(IProgress<StatusCenterItemProgressModel>? progress)
+			{
+				_progress = progress;
+			}
+
+			public void Report(StatusCenterItemProgressModel value)
+			{
+				// Statuses can be flag combinations such as InProgress | Generic, so compare them as a whole
+				if (value.Status is FileSystemStatusCode status &&
+					status != FileSystemStatusCode.Success &&
+					status != FileSystemStatusCode.InProgress)
+					AnyFailed = true;
+
+				_progress?.Report(value);
+			}
 		}
 	}
 }
