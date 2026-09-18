@@ -397,7 +397,7 @@ namespace Files.App.Utils.Storage
 			}, App.Logger);
 		}
 
-		public static Task<(bool, ShellOperationResult)> MoveItemAsync(string[] fileToMovePath, string[] moveDestination, bool overwriteOnMove, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel> progress, string operationID = "", CancellationToken cancellationToken = default)
+		public static Task<(bool, ShellOperationResult)> MoveItemAsync(string[] fileToMovePath, string[] moveDestination, bool overwriteOnMove, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel> progress, string operationID = "", CancellationToken cancellationToken = default, bool reportCompletion = true)
 		{
 			operationID = string.IsNullOrEmpty(operationID) ? Guid.NewGuid().ToString() : operationID;
 
@@ -538,7 +538,8 @@ namespace Files.App.Utils.Storage
 
 				var moveSucceeded = await moveTcs.Task;
 
-				if (moveSucceeded)
+				// Another batch can follow on the same status card, only the last one completes it
+				if (moveSucceeded && reportCompletion)
 				{
 					// The operation can complete before the enumeration reported the size, so make sure the progress ends at 100%
 					if (fsProgress.TotalSize < sizeCalculator.Size)
@@ -553,7 +554,7 @@ namespace Files.App.Utils.Storage
 			}, App.Logger);
 		}
 
-		public static Task<(bool, ShellOperationResult)> CopyItemAsync(string[] fileToCopyPath, string[] copyDestination, bool overwriteOnCopy, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel> progress, string operationID = "", CancellationToken cancellationToken = default)
+		public static Task<(bool, ShellOperationResult)> CopyItemAsync(string[] fileToCopyPath, string[] copyDestination, bool overwriteOnCopy, long ownerHwnd, bool asAdmin, IProgress<StatusCenterItemProgressModel> progress, string operationID = "", CancellationToken cancellationToken = default, bool reportCompletion = true)
 		{
 			operationID = string.IsNullOrEmpty(operationID) ? Guid.NewGuid().ToString() : operationID;
 
@@ -697,7 +698,8 @@ namespace Files.App.Utils.Storage
 
 				var copySucceeded = await copyTcs.Task;
 
-				if (copySucceeded)
+				// Another batch can follow on the same status card, only the last one completes it
+				if (copySucceeded && reportCompletion)
 				{
 					// The operation can complete before the enumeration reported the size, so make sure the progress ends at 100%
 					if (fsProgress.TotalSize < sizeCalculator.Size)

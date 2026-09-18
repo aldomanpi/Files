@@ -482,7 +482,13 @@ namespace Files.App.Utils.Storage
 			await Task.Yield();
 
 			if (returnStatus == ReturnResult.InProgress || returnStatus == ReturnResult.Success)
+			{
 				banner.Progress.ReportStatus(FileSystemStatusCode.Success);
+
+				// The report above is posted to the UI thread and isn't drained before the final card is built,
+				// so update the status explicitly
+				returnStatus = ReturnResult.Success;
+			}
 
 			if (registerHistory &&
 				history?.Destination is { } historyDestinations &&
