@@ -2327,15 +2327,35 @@ namespace Files.App.ViewModels
 					// A removable device saturated by a file transfer can legitimately take a while
 					: TimeSpan.FromSeconds(60);
 
-				(hFile, findData, errorCode) = await findTask.WithTimeoutAsync(findTimeout);
+				// Race the find call against the timeout, so that navigating away ends the wait
+				// immediately instead of holding the enumeration semaphore until it elapses
+				var completed = await Task.WhenAny(findTask, Task.Delay(findTimeout, cancellationToken));
 
-				// The find handle may still arrive after the timeout; release it when it does
-				if (hFile is null)
+				if (completed == findTask)
+				{
+					(hFile, findData, errorCode) = await findTask;
+				}
+				else
+				{
+					// The find handle may still arrive after the wait; release it when it does
+					// and observe a failure that no longer has anyone waiting on it
 					_ = findTask.ContinueWith(
-						t => t.Result.Item1?.Dispose(),
+						t =>
+						{
+							if (t.IsFaulted)
+								App.Logger.LogWarning(t.Exception, "Directory enumeration failed after the wait was abandoned.");
+							else if (t.Status == TaskStatus.RanToCompletion)
+								t.Result.Item1?.Dispose();
+						},
 						CancellationToken.None,
-						TaskContinuationOptions.OnlyOnRanToCompletion,
+						TaskContinuationOptions.ExecuteSynchronously,
 						TaskScheduler.Default);
+
+					// The wait ended because the tab navigated away, not because the device is
+					// unresponsive, so don't report the location as unavailable
+					if (cancellationToken.IsCancellationRequested)
+						return -1;
+				}
 			}
 
 			if (!enumFromStorageFolder && hFile is not null && !hFile.IsInvalid)
@@ -3429,11 +3449,21 @@ namespace Files.App.ViewModels
 				{
 					var itemsRegrouped = false;
 
+					// The properties were read before the semaphore was taken, so a refresh may
+					// have replaced the instances they were read for; apply them to the live ones
+					var currentItems = filesAndFolders.ToList();
+
 					foreach (var result in results)
 					{
 						if (result is not null)
 						{
-							var item = result.Value.Item;
+							var resultPath = result.Value.Item.ItemPath;
+							var item = currentItems.FirstOrDefault(x => string.Equals(x.ItemPath, resultPath, StringComparison.OrdinalIgnoreCase));
+
+							// The item is gone from the listing, the update no longer applies
+							if (item is null)
+								continue;
+
 							item.ItemDateModifiedReal = result.Value.Modified;
 							item.ItemDateCreatedReal = result.Value.Created;
 
