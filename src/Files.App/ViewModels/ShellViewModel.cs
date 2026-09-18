@@ -178,6 +178,8 @@ namespace Files.App.ViewModels
 		private CancellationTokenSource? networkAvailabilityCTS;
 		private bool isDisposed;
 
+		private static readonly TimeSpan WatcherRefreshDelay = TimeSpan.FromMilliseconds(500);
+
 		public event EventHandler? FocusFilterHeader;
 
 		public event EventHandler? DirectoryInfoUpdated;
@@ -2317,24 +2319,23 @@ namespace Files.App.ViewModels
 					return (hFileTsk, findDataTsk, hFileTsk.IsInvalid ? Marshal.GetLastWin32Error() : 0);
 				});
 
-				// Only time out on network locations; a removable device saturated by a file
-				// transfer can legitimately take longer than this to return the first entry.
-				if (isNetwork || isNetdisk)
-				{
-					(hFile, findData, errorCode) = await findTask.WithTimeoutAsync(TimeSpan.FromSeconds(5));
+				// Bound every path: the enumeration semaphore is held here, so a call that never
+				// returns, e.g. a device unplugged mid-copy, would wedge the tab permanently
+				var findTimeout = isNetwork || isNetdisk
+					// Unreachable shares are expected to fail fast
+					? TimeSpan.FromSeconds(5)
+					// A removable device saturated by a file transfer can legitimately take a while
+					: TimeSpan.FromSeconds(60);
 
-					// The find handle may still arrive after the timeout; release it when it does
-					if (hFile is null)
-						_ = findTask.ContinueWith(
-							t => t.Result.Item1?.Dispose(),
-							CancellationToken.None,
-							TaskContinuationOptions.OnlyOnRanToCompletion,
-							TaskScheduler.Default);
-				}
-				else
-				{
-					(hFile, findData, errorCode) = await findTask;
-				}
+				(hFile, findData, errorCode) = await findTask.WithTimeoutAsync(findTimeout);
+
+				// The find handle may still arrive after the timeout; release it when it does
+				if (hFile is null)
+					_ = findTask.ContinueWith(
+						t => t.Result.Item1?.Dispose(),
+						CancellationToken.None,
+						TaskContinuationOptions.OnlyOnRanToCompletion,
+						TaskScheduler.Default);
 			}
 
 			if (!enumFromStorageFolder && hFile is not null && !hFile.IsInvalid)
@@ -2780,48 +2781,93 @@ namespace Files.App.ViewModels
 		private void ScheduleWatcherRefresh()
 		{
 			var refreshCTS = new CancellationTokenSource();
-			var previousCTS = Interlocked.Exchange(ref watcherRefreshCTS, refreshCTS);
 
-			previousCTS?.Cancel();
-			previousCTS?.Dispose();
-
+			// Read the token before publishing the source: once published, CloseWatcher or Dispose
+			// may take and dispose it, and reading Token afterwards would throw
 			var token = refreshCTS.Token;
 
-			// refreshCTS is disposed by the next notification, so the continuation must not register on its token
-			_ = Task.Delay(500, token)
-				.ContinueWith(_ => dispatcherQueue.EnqueueOrInvokeAsync(() =>
-					{
-						if (!token.IsCancellationRequested)
-							RefreshItems(null);
-					}),
-					CancellationToken.None,
-					TaskContinuationOptions.OnlyOnRanToCompletion,
-					TaskScheduler.Default)
-				.Unwrap();
+			// Throttle instead of debouncing: a refresh that is already pending keeps its deadline,
+			// so notifications arriving faster than the delay can't starve it
+			if (Interlocked.CompareExchange(ref watcherRefreshCTS, refreshCTS, null) is not null)
+			{
+				refreshCTS.Dispose();
+				return;
+			}
+
+			_ = RunWatcherRefreshAsync(refreshCTS, token, WorkingDirectory);
+		}
+
+		private async Task RunWatcherRefreshAsync(CancellationTokenSource refreshCTS, CancellationToken token, string? scheduledDirectory)
+		{
+			var owned = false;
+
+			try
+			{
+				// Wait for an enumeration that is already running to finish rather than cancelling it
+				do
+				{
+					await Task.Delay(WatcherRefreshDelay, token);
+				}
+				while (IsLoadingItems);
+
+				// Stop being the pending refresh before running, so notifications raised while the
+				// refresh is in progress schedule the next one
+				owned = ReferenceEquals(Interlocked.CompareExchange(ref watcherRefreshCTS, null, refreshCTS), refreshCTS);
+
+				await dispatcherQueue.EnqueueOrInvokeAsync(() =>
+				{
+					// The notification no longer applies once the tab has navigated elsewhere
+					if (!token.IsCancellationRequested &&
+						string.Equals(WorkingDirectory, scheduledDirectory, StringComparison.OrdinalIgnoreCase))
+						RefreshItems(null);
+				});
+			}
+			catch (OperationCanceledException)
+			{
+				// CloseWatcher or Dispose dropped the refresh
+			}
+			catch (Exception ex)
+			{
+				App.Logger.LogWarning(ex, ex.Message);
+			}
+			finally
+			{
+				// Never leave a stale source published, or later notifications would be dropped
+				if (!owned)
+					owned = ReferenceEquals(Interlocked.CompareExchange(ref watcherRefreshCTS, null, refreshCTS), refreshCTS);
+
+				if (owned)
+					refreshCTS.Dispose();
+			}
 		}
 
 		private void DirectoryWatcher_Changed(object sender, FileSystemEventArgs e)
 		{
 			Debug.WriteLine($"Directory watcher event: {e.ChangeType}, {e.FullPath}");
 
-			ScheduleWatcherRefresh();
+			// An exception escaping a watcher thread would take the process down
+			SafetyExtensions.IgnoreExceptions(ScheduleWatcherRefresh, App.Logger);
 		}
 
 		private void ItemQueryResult_ContentsChanged(IStorageQueryResultBase sender, object args)
 		{
-			// Query options have to be reapplied otherwise old results are returned
-			var options = new QueryOptions()
+			// An exception escaping a watcher thread would take the process down
+			SafetyExtensions.IgnoreExceptions(() =>
 			{
-				FolderDepth = FolderDepth.Shallow,
-				IndexerOption = IndexerOption.OnlyUseIndexerAndOptimizeForIndexedProperties
-			};
+				// Query options have to be reapplied otherwise old results are returned
+				var options = new QueryOptions()
+				{
+					FolderDepth = FolderDepth.Shallow,
+					IndexerOption = IndexerOption.OnlyUseIndexerAndOptimizeForIndexedProperties
+				};
 
-			options.SetPropertyPrefetch(PropertyPrefetchOptions.None, null);
-			options.SetThumbnailPrefetch(ThumbnailMode.ListView, 0, ThumbnailOptions.ReturnOnlyIfCached);
+				options.SetPropertyPrefetch(PropertyPrefetchOptions.None, null);
+				options.SetThumbnailPrefetch(ThumbnailMode.ListView, 0, ThumbnailOptions.ReturnOnlyIfCached);
 
-			sender.ApplyNewQueryOptions(options);
+				sender.ApplyNewQueryOptions(options);
 
-			ScheduleWatcherRefresh();
+				ScheduleWatcherRefresh();
+			}, App.Logger);
 		}
 
 		private void WatchForDirectoryChanges(string path, CloudDriveSyncStatus syncStatus)
