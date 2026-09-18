@@ -1037,10 +1037,11 @@ namespace Files.App.Utils.Storage
 			if (observer.AnyFailed && !token.IsCancellationRequested)
 				fsProgress.ReportStatus(FileSystemStatusCode.Generic);
 
-			if (rawStorageHistory.Count > 0 && rawStorageHistory.All(item => item is not null))
+			// Items without a history (failed, overwritten or moved under a generated name) can't be undone,
+			// but the rest of the batch still can
+			var storageHistory = rawStorageHistory.WhereNotNull().ToList();
+			if (storageHistory.Count > 0)
 			{
-				var storageHistory = rawStorageHistory.WhereNotNull().ToList();
-
 				// Items that were cloned instead of moved are reported as a copy, undoing a mixed batch
 				// as a single operation would delete the moved items, so don't provide any history
 				if (storageHistory.Any(item => item.OperationType != storageHistory[0].OperationType))
