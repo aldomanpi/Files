@@ -121,13 +121,45 @@ namespace Files.App.Utils.Storage
 			}
 		}
 
+		/// <summary>
+		/// Resolves the parent folder of <paramref name="destination"/>, reusing the per-batch cache when one is supplied.
+		/// </summary>
+		/// <remarks>
+		/// Only MTP destinations are cached: every resolution is a device round-trip that is serialized with the
+		/// user's own reads of the device. Local paths are cheap and must not be cached, because a folder can be
+		/// created or removed in the middle of a batch (e.g. by CloneDirectoryAsync).
+		/// Failed resolutions are never cached, so a parent folder created later in the batch is still picked up.
+		/// </remarks>
+		private async Task<FilesystemResult<BaseStorageFolder>> GetDestinationFolderAsync(string destination, Dictionary<string, FilesystemResult<BaseStorageFolder>>? destinationFolderCache, CancellationToken cancellationToken)
+		{
+			var parentPath = PathNormalization.GetParentDir(destination);
+
+			if (destinationFolderCache is null || !destination.StartsWith("\\\\?\\", StringComparison.Ordinal))
+				return await ShellViewModel.GetFolderFromPathAsync(parentPath, cancellationToken);
+
+			if (destinationFolderCache.TryGetValue(parentPath, out var cachedResult))
+				return cachedResult;
+
+			var folderResult = await ShellViewModel.GetFolderFromPathAsync(parentPath, cancellationToken);
+
+			if (folderResult)
+				destinationFolderCache[parentPath] = folderResult;
+
+			return folderResult;
+		}
+
 		public Task<IStorageHistory?> CopyAsync(IStorageItem source, string destination, NameCollisionOption collision, IProgress<StatusCenterItemProgressModel>? progress, CancellationToken cancellationToken)
 		{
 			return CopyAsync(source.FromStorageItem()
 				?? throw new InvalidOperationException("The storage item could not be converted for copying."), destination, collision, progress, cancellationToken);
 		}
 
-		public async Task<IStorageHistory?> CopyAsync(IStorageItemWithPath source, string destination, NameCollisionOption collision, IProgress<StatusCenterItemProgressModel>? progress, CancellationToken cancellationToken)
+		public Task<IStorageHistory?> CopyAsync(IStorageItemWithPath source, string destination, NameCollisionOption collision, IProgress<StatusCenterItemProgressModel>? progress, CancellationToken cancellationToken)
+		{
+			return CopyAsync(source, destination, collision, progress, cancellationToken, null);
+		}
+
+		private async Task<IStorageHistory?> CopyAsync(IStorageItemWithPath source, string destination, NameCollisionOption collision, IProgress<StatusCenterItemProgressModel>? progress, CancellationToken cancellationToken, Dictionary<string, FilesystemResult<BaseStorageFolder>>? destinationFolderCache)
 		{
 			StatusCenterItemProgressModel fsProgress = new(
 				progress,
@@ -182,7 +214,7 @@ namespace Files.App.Utils.Storage
 				{
 					// CopyFileFromApp only works on file not directories
 					var fsSourceFolder = await source.ToStorageItemResult();
-					var fsDestinationFolder = await ShellViewModel.GetFolderFromPathAsync(PathNormalization.GetParentDir(destination), cancellationToken);
+					var fsDestinationFolder = await GetDestinationFolderAsync(destination, destinationFolderCache, cancellationToken);
 					var fsResult = (FilesystemResult)(fsSourceFolder.ErrorCode | fsDestinationFolder.ErrorCode);
 
 					if (fsResult &&
@@ -244,7 +276,7 @@ namespace Files.App.Utils.Storage
 				{
 					Debug.WriteLine(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
-					FilesystemResult<BaseStorageFolder> destinationResult = await ShellViewModel.GetFolderFromPathAsync(PathNormalization.GetParentDir(destination), cancellationToken);
+					FilesystemResult<BaseStorageFolder> destinationResult = await GetDestinationFolderAsync(destination, destinationFolderCache, cancellationToken);
 					var sourceResult = await source.ToStorageItemResult();
 					fsResult = sourceResult.ErrorCode | destinationResult.ErrorCode;
 
@@ -334,7 +366,12 @@ namespace Files.App.Utils.Storage
 				?? throw new InvalidOperationException("The storage item could not be converted for moving."), destination, collision, progress, cancellationToken);
 		}
 
-		public async Task<IStorageHistory?> MoveAsync(IStorageItemWithPath source, string destination, NameCollisionOption collision, IProgress<StatusCenterItemProgressModel>? progress, CancellationToken cancellationToken)
+		public Task<IStorageHistory?> MoveAsync(IStorageItemWithPath source, string destination, NameCollisionOption collision, IProgress<StatusCenterItemProgressModel>? progress, CancellationToken cancellationToken)
+		{
+			return MoveAsync(source, destination, collision, progress, cancellationToken, null);
+		}
+
+		private async Task<IStorageHistory?> MoveAsync(IStorageItemWithPath source, string destination, NameCollisionOption collision, IProgress<StatusCenterItemProgressModel>? progress, CancellationToken cancellationToken, Dictionary<string, FilesystemResult<BaseStorageFolder>>? destinationFolderCache)
 		{
 			StatusCenterItemProgressModel fsProgress = new(
 				progress,
@@ -355,7 +392,7 @@ namespace Files.App.Utils.Storage
 				// Cannot move (only copy) files from MTP devices because:
 				// StorageItems returned in DataPackageView are read-only
 				// The item.Path property will be empty and there's no way of retrieving a new StorageItem with R/W access
-				return await CopyAsync(source, destination, collision, progress, cancellationToken);
+				return await CopyAsync(source, destination, collision, progress, cancellationToken, destinationFolderCache);
 			}
 
 			if (destination.StartsWith(Constants.UserEnvironmentPaths.RecycleBinPath, StringComparison.Ordinal))
@@ -412,7 +449,7 @@ namespace Files.App.Utils.Storage
 						Debug.WriteLine(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
 						var fsSourceFolder = await source.ToStorageItemResult();
-						var fsDestinationFolder = await ShellViewModel.GetFolderFromPathAsync(PathNormalization.GetParentDir(destination), cancellationToken);
+						var fsDestinationFolder = await GetDestinationFolderAsync(destination, destinationFolderCache, cancellationToken);
 						fsResult = fsSourceFolder.ErrorCode | fsDestinationFolder.ErrorCode;
 
 						if (fsResult &&
@@ -483,7 +520,7 @@ namespace Files.App.Utils.Storage
 				{
 					Debug.WriteLine(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
-					FilesystemResult<BaseStorageFolder> destinationResult = await ShellViewModel.GetFolderFromPathAsync(PathNormalization.GetParentDir(destination), cancellationToken);
+					FilesystemResult<BaseStorageFolder> destinationResult = await GetDestinationFolderAsync(destination, destinationFolderCache, cancellationToken);
 					var sourceResult = await source.ToStorageItemResult();
 					fsResult = sourceResult.ErrorCode | destinationResult.ErrorCode;
 
@@ -965,6 +1002,10 @@ namespace Files.App.Utils.Storage
 
 			var rawStorageHistory = new List<IStorageHistory?>();
 
+			// Resolving the destination parent folder of an MTP device once per batch instead of once per item
+			// keeps the device free for the user's own browsing while the batch runs
+			var destinationFolderCache = new Dictionary<string, FilesystemResult<BaseStorageFolder>>(StringComparer.OrdinalIgnoreCase);
+
 			for (int i = 0; i < source.Count; i++)
 			{
 				if (token.IsCancellationRequested)
@@ -979,7 +1020,8 @@ namespace Files.App.Utils.Storage
 						destination[i],
 						collisions[i].Convert(),
 						progress,
-						token));
+						token,
+						destinationFolderCache));
 				}
 
 				fsProgress.AddProcessedItemsCount(1);
@@ -1013,6 +1055,10 @@ namespace Files.App.Utils.Storage
 			var rawStorageHistory = new List<IStorageHistory?>();
 			var observer = new FailureObservingProgress(progress);
 
+			// Resolving the destination parent folder of an MTP device once per batch instead of once per item
+			// keeps the device free for the user's own browsing while the batch runs
+			var destinationFolderCache = new Dictionary<string, FilesystemResult<BaseStorageFolder>>(StringComparer.OrdinalIgnoreCase);
+
 			for (int i = 0; i < source.Count; i++)
 			{
 				if (token.IsCancellationRequested)
@@ -1027,7 +1073,8 @@ namespace Files.App.Utils.Storage
 						destination[i],
 						collisions[i].Convert(),
 						observer,
-						token));
+						token,
+						destinationFolderCache));
 				}
 
 				fsProgress.AddProcessedItemsCount(1);

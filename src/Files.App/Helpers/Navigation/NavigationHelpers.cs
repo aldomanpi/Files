@@ -639,12 +639,13 @@ namespace Files.App.Helpers
 				if (associatedInstance.ShellViewModel is not null)
 				{
 					opened = await associatedInstance.ShellViewModel.GetFolderWithPathFromPathAsync(path)
-						.OnSuccess(async (childFolder) =>
+						.OnSuccess((childFolder) =>
 						{
 							var folder = childFolder!;
 							// Add location to Recent Items List.
 							// File.Exists distinguishes an archive root (real file on disk) from an inner path like "archive.zip\sub".
-							await STATask.RunPooled(() =>
+							// Fire-and-forget: the STA pool can be saturated by a running transfer and navigation must not wait on it.
+							_ = STATask.RunPooled(() =>
 							{
 								if (folder.Item is SystemStorageFolder ||
 									(folder.Item is ZipStorageFolder && File.Exists(folder.Path)))
