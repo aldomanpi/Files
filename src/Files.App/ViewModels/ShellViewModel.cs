@@ -2348,13 +2348,19 @@ namespace Files.App.ViewModels
 								t.Result.Item1?.Dispose();
 						},
 						CancellationToken.None,
-						TaskContinuationOptions.ExecuteSynchronously,
+						TaskContinuationOptions.None,
 						TaskScheduler.Default);
 
 					// The wait ended because the tab navigated away, not because the device is
 					// unresponsive, so don't report the location as unavailable
 					if (cancellationToken.IsCancellationRequested)
 						return -1;
+
+					// The device didn't answer in time; looking the folder up through the shell
+					// would block on the same device with no bound while the enumeration semaphore is held
+					ShowLocationUnavailable(LocationUnavailableKind.DriveUnplugged);
+
+					return -1;
 				}
 			}
 
