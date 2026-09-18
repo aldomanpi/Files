@@ -987,9 +987,10 @@ namespace Files.App.Utils.Storage
 
 			}
 
-			if (rawStorageHistory.Count > 0 && rawStorageHistory.All(item => item is not null))
+			// Items without a history (failed or overwritten) can't be undone, but the rest of the batch still can
+			var storageHistory = rawStorageHistory.WhereNotNull().ToList();
+			if (storageHistory.Count > 0)
 			{
-				var storageHistory = rawStorageHistory.WhereNotNull().ToList();
 				return new StorageHistory(
 					storageHistory[0].OperationType,
 					await storageHistory.SelectMany(item => item.Source).ToListAsync(),
