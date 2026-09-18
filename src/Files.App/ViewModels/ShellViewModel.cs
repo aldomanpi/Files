@@ -174,6 +174,7 @@ namespace Files.App.ViewModels
 		private CancellationTokenSource? searchCTS;
 		private CancellationTokenSource? updateTagGroupCTS;
 		private CancellationTokenSource? filterDebounceCS;
+		private CancellationTokenSource? watcherRefreshCTS;
 		private CancellationTokenSource? networkAvailabilityCTS;
 		private bool isDisposed;
 
@@ -2239,6 +2240,11 @@ namespace Files.App.ViewModels
 			gitProcessQueueAction = null;
 			watcherCTS?.Cancel();
 			watcherCTS = new CancellationTokenSource();
+
+			// Drop any refresh scheduled by a watcher notification, it no longer applies
+			var pendingRefreshCTS = Interlocked.Exchange(ref watcherRefreshCTS, null);
+			pendingRefreshCTS?.Cancel();
+			pendingRefreshCTS?.Dispose();
 		}
 
 		private async Task PromptToUnlockBitlockerIfLockedAsync(string path, string pathRoot)
@@ -2298,7 +2304,7 @@ namespace Files.App.ViewModels
 			int errorCode = 0;
 			if (!enumFromStorageFolder)
 			{
-				(hFile, findData, errorCode) = await Task.Run(() =>
+				var findTask = Task.Run(() =>
 				{
 					var hFileTsk = FindFirstFileExFromAppSafe(
 						path + "\\*.*",
@@ -2309,8 +2315,26 @@ namespace Files.App.ViewModels
 						FIND_FIRST_EX_LARGE_FETCH);
 
 					return (hFileTsk, findDataTsk, hFileTsk.IsInvalid ? Marshal.GetLastWin32Error() : 0);
-				})
-				.WithTimeoutAsync(TimeSpan.FromSeconds(5));
+				});
+
+				// Only time out on network locations; a removable device saturated by a file
+				// transfer can legitimately take longer than this to return the first entry.
+				if (isNetwork || isNetdisk)
+				{
+					(hFile, findData, errorCode) = await findTask.WithTimeoutAsync(TimeSpan.FromSeconds(5));
+
+					// The find handle may still arrive after the timeout; release it when it does
+					if (hFile is null)
+						_ = findTask.ContinueWith(
+							t => t.Result.Item1?.Dispose(),
+							CancellationToken.None,
+							TaskContinuationOptions.OnlyOnRanToCompletion,
+							TaskScheduler.Default);
+				}
+				else
+				{
+					(hFile, findData, errorCode) = await findTask;
+				}
 			}
 
 			if (!enumFromStorageFolder && hFile is not null && !hFile.IsInvalid)
@@ -2749,17 +2773,41 @@ namespace Files.App.ViewModels
 			}, App.Logger);
 		}
 
-		private async void DirectoryWatcher_Changed(object sender, FileSystemEventArgs e)
+		/// <summary>
+		/// Coalesces watcher notifications into a single refresh, so that a burst of changes,
+		/// e.g. while a file transfer into the folder is running, doesn't keep restarting enumeration.
+		/// </summary>
+		private void ScheduleWatcherRefresh()
+		{
+			var refreshCTS = new CancellationTokenSource();
+			var previousCTS = Interlocked.Exchange(ref watcherRefreshCTS, refreshCTS);
+
+			previousCTS?.Cancel();
+			previousCTS?.Dispose();
+
+			var token = refreshCTS.Token;
+
+			// refreshCTS is disposed by the next notification, so the continuation must not register on its token
+			_ = Task.Delay(500, token)
+				.ContinueWith(_ => dispatcherQueue.EnqueueOrInvokeAsync(() =>
+					{
+						if (!token.IsCancellationRequested)
+							RefreshItems(null);
+					}),
+					CancellationToken.None,
+					TaskContinuationOptions.OnlyOnRanToCompletion,
+					TaskScheduler.Default)
+				.Unwrap();
+		}
+
+		private void DirectoryWatcher_Changed(object sender, FileSystemEventArgs e)
 		{
 			Debug.WriteLine($"Directory watcher event: {e.ChangeType}, {e.FullPath}");
 
-			await dispatcherQueue.EnqueueOrInvokeAsync(() =>
-			{
-				RefreshItems(null);
-			});
+			ScheduleWatcherRefresh();
 		}
 
-		private async void ItemQueryResult_ContentsChanged(IStorageQueryResultBase sender, object args)
+		private void ItemQueryResult_ContentsChanged(IStorageQueryResultBase sender, object args)
 		{
 			// Query options have to be reapplied otherwise old results are returned
 			var options = new QueryOptions()
@@ -2773,10 +2821,7 @@ namespace Files.App.ViewModels
 
 			sender.ApplyNewQueryOptions(options);
 
-			await dispatcherQueue.EnqueueOrInvokeAsync(() =>
-			{
-				RefreshItems(null);
-			});
+			ScheduleWatcherRefresh();
 		}
 
 		private void WatchForDirectoryChanges(string path, CloudDriveSyncStatus syncStatus)
@@ -3172,22 +3217,27 @@ namespace Files.App.ViewModels
 				return;
 			}
 
-			if (!filesAndFolders.ToList().Any(x => x.GetRequiredPath().Equals(item.GetRequiredPath(), StringComparison.OrdinalIgnoreCase))) // Avoid adding duplicate items
+			try
 			{
-				filesAndFolders.Add(item);
-
-				if (UserSettingsService.FoldersSettingsService.AreAlternateStreamsVisible)
+				if (!filesAndFolders.ToList().Any(x => x.GetRequiredPath().Equals(item.GetRequiredPath(), StringComparison.OrdinalIgnoreCase))) // Avoid adding duplicate items
 				{
-					// New file added, enumerate ADS
-					foreach (var ads in Win32Helper.GetAlternateStreams(item.GetRequiredPath()))
+					filesAndFolders.Add(item);
+
+					if (UserSettingsService.FoldersSettingsService.AreAlternateStreamsVisible)
 					{
-						var adsItem = Win32StorageEnumerator.GetAlternateStream(ads, item);
-						filesAndFolders.Add(adsItem);
+						// New file added, enumerate ADS
+						foreach (var ads in Win32Helper.GetAlternateStreams(item.GetRequiredPath()))
+						{
+							var adsItem = Win32StorageEnumerator.GetAlternateStream(ads, item);
+							filesAndFolders.Add(adsItem);
+						}
 					}
 				}
 			}
-
-			enumFolderSemaphore.Release();
+			finally
+			{
+				enumFolderSemaphore.Release();
+			}
 		}
 
 		private async Task<ListedItem?> AddFileOrFolderAsync(string fileOrFolderPath)
@@ -3313,6 +3363,11 @@ namespace Files.App.ViewModels
 				}
 			}
 
+			// Read the updated properties before taking the enumeration semaphore: opening the items
+			// on a busy device can block for a long time and would otherwise stall navigation
+			var matchingItems = filesAndFolders.ToList().Where(x => paths.Any(p => p.Equals(x.ItemPath, StringComparison.OrdinalIgnoreCase)));
+			var results = await Task.WhenAll(matchingItems.Select(x => GetFileOrFolderUpdateInfoAsync(x, hasSyncStatus)));
+
 			try
 			{
 				await enumFolderSemaphore.WaitAsync(semaphoreCTS.Token);
@@ -3324,9 +3379,6 @@ namespace Files.App.ViewModels
 
 			try
 			{
-				var matchingItems = filesAndFolders.ToList().Where(x => paths.Any(p => p.Equals(x.ItemPath, StringComparison.OrdinalIgnoreCase)));
-				var results = await Task.WhenAll(matchingItems.Select(x => GetFileOrFolderUpdateInfoAsync(x, hasSyncStatus)));
-
 				await dispatcherQueue.EnqueueOrInvokeAsync(() =>
 				{
 					var itemsRegrouped = false;
@@ -3498,6 +3550,9 @@ namespace Files.App.ViewModels
 			StopWatchingForLocationRestoration();
 			filterDebounceCS?.Cancel();
 			filterDebounceCS?.Dispose();
+			var pendingRefreshCTS = Interlocked.Exchange(ref watcherRefreshCTS, null);
+			pendingRefreshCTS?.Cancel();
+			pendingRefreshCTS?.Dispose();
 			networkAvailabilityCTS?.Dispose();
 			semaphoreCTS.Cancel();
 			searchCTS?.Cancel();
